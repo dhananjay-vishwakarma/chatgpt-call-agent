@@ -13,8 +13,8 @@ OPENAI_VOICE = os.getenv("OPENAI_VOICE", "verse")
 AI_INSTRUCTIONS = os.getenv(
     "AI_INSTRUCTIONS",
     "You are a friendly HRMS payroll assistant. Greet warmly, "
-    "give a short pitch about payroll automation, "
-    "and ask one polite follow-up question."
+    "give a short pitch about payroll automation, compliance, "
+    "and cost savings. Ask follow-up questions to keep the conversation going."
 )
 
 app = FastAPI()
@@ -30,11 +30,11 @@ async def voice(request: Request):
     print(f"✅ Incoming call from {from_number}")
 
     twiml = VoiceResponse()
-    twiml.say("Connecting you to our AI assistant. Please hold.", voice="alice")
+    twiml.say("Hello! Connecting you to our AI assistant now.", voice="alice")
 
     connect = Connect()
     stream = Stream(
-        url="wss://YOUR_DOMAIN/ws",   # <-- important: relay endpoint in this same app
+        url="wss://YOUR_DOMAIN/ws",   # <-- replace with your relay URL
         track="both",
         status_callback="/stream-events",
         status_callback_method="POST"
@@ -42,8 +42,8 @@ async def voice(request: Request):
     connect.append(stream)
     twiml.append(connect)
 
-    # keep call open long enough
-    twiml.pause(length=60)
+    # keep the call open (AI keeps the loop alive)
+    twiml.pause(length=600)  # 10 minutes
     return Response(content=str(twiml), media_type="application/xml")
 
 
@@ -126,6 +126,7 @@ async def ws_twilio(websocket: WebSocket):
                 etype = msg.get("event")
                 if etype == "start":
                     print("🔔 Twilio stream started")
+                    # send initial greeting from AI
                     await openai_ws.send(json.dumps({
                         "type": "response.create",
                         "response": {
@@ -171,7 +172,7 @@ async def ws_twilio(websocket: WebSocket):
                             "media": {"payload": audio_chunk_b64}
                         }))
                 elif dtype == "response.completed":
-                    print("✅ OpenAI response completed")
+                    print("✅ OpenAI finished a reply")
         except Exception as e:
             print("❌ Error openai_to_twilio:", e)
         try:
