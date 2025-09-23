@@ -1,309 +1,108 @@
 import os
-import threading
-import time
 import requests
-from flask import Flask, Response, request
-from twilio.twiml.voice_response import VoiceResponse, Connect, Stream
-
-# Optional Twilio REST client (used for outbound recall attempts)
-try:
-    from twilio.rest import Client as TwilioClient
-except Exception:
-    TwilioClient = None
+from flask import Flask, Response, request, url_for
 
 app = Flask(__name__)
-openai_api_key = os.getenv("OPENAI_API_KEY")
-twilio_account_sid = os.getenv("TWILIO_ACCOUNT_SID")
-twilio_auth_token = os.getenv("TWILIO_AUTH_TOKEN")
-twilio_caller_id = os.getenv("TWILIO_CALLER_ID")  # the From number for outbound recalls
-# recall settings
-RECALL_DELAY = int(os.getenv("RECALL_DELAY_SECONDS", "5"))
-RECALL_MAX = int(os.getenv("RECALL_MAX_ATTEMPTS", "12"))
 
+# API Keys
+openai_api_key = os.getenv("OPENAI_API_KEY")
+
+# Folder to save temporary audio files
+AUDIO_FOLDER = "static/audio"
+os.makedirs(AUDIO_FOLDER, exist_ok=True)
+
+# ----------------------------
+# Step 1: Handle incoming call
+# ----------------------------
 @app.route("/voice", methods=["POST"])
 def voice():
-    print("✅ Twilio POST /voice received")
-    print(f"🔔 Caller: {request.form.get('From')} -> Callee: {request.form.get('To')}")
-    call_sid = request.form.get("CallSid")
     from_number = request.form.get("From")
+    print(f"✅ Incoming call from {from_number}")
 
-    # Quick check: ensure OpenAI API key is set
-    if not openai_api_key:
-        print("❌ OPENAI_API_KEY not set in environment. Cannot create realtime session.")
-        twiml = VoiceResponse()
-        twiml.say("Sorry, the AI assistant is not configured. Please contact support.", voice="alice")
-        return Response(str(twiml), mimetype="application/xml")
+    # Ask caller to say something
+    twiml = f"""
+    <Response>
+        <Say voice="alice">Hello! Please tell me your question after the beep. Then press star.</Say>
+        <Record 
+            action="/process_recording" 
+            method="POST" 
+            maxLength="20" 
+            finishOnKey="*"
+            playBeep="true"/>
+        <Say>I did not receive any input. Goodbye.</Say>
+    </Response>
+    """
+    return Response(twiml, mimetype="application/xml")
 
-    # Start TwiML response with greeting
-    twiml = VoiceResponse()
-    twiml.say(
-        "Hello! Thanks for taking this call. Please hold for a quick message about payroll automation.",
-        voice="alice"
-    )
+# -----------------------------------
+# Step 2: Process recording from user
+# -----------------------------------
+@app.route("/process_recording", methods=["POST"])
+def process_recording():
+    recording_url = request.form.get("RecordingUrl")
+    print(f"🎙 Received recording: {recording_url}.wav")
 
-    # Step 1: Create OpenAI session
-    try:
-        payload = {
-            "model": "gpt-4o-realtime-preview-2024-12",
-            "voice": "verse",
-            "instructions": (
-                "You are a friendly HRMS payroll software agent. "
-                "As soon as the call connects, start speaking immediately. "
-                "Greet warmly, then deliver a concise 60-second pitch about payroll automation, "
-                "compliance benefits, and cost savings. "
-                "Keep it conversational and not pushy. "
-                "End by asking one polite follow-up question, then wrap up nicely."
-            )
-        }
-        print(f"📤 Sending to OpenAI: {payload}")
-        r = requests.post(
-            "https://api.openai.com/v1/realtime/sessions",
-            headers={
-                "Authorization": f"Bearer {openai_api_key}",
-                "Content-Type": "application/json"
-            },
-            json=payload,
-            timeout=10
+    # Download Twilio recording (WAV file)
+    audio_file = os.path.join(AUDIO_FOLDER, "caller.wav")
+    r = requests.get(recording_url + ".wav")
+    with open(audio_file, "wb") as f:
+        f.write(r.content)
+
+    # Step 2.1: Transcribe with Whisper
+    with open(audio_file, "rb") as f:
+        transcription = requests.post(
+            "https://api.openai.com/v1/audio/transcriptions",
+            headers={"Authorization": f"Bearer {openai_api_key}"},
+            files={"file": f},
+            data={"model": "gpt-4o-transcribe"}
         )
-    except Exception as e:
-        print(f"❌ Exception while calling OpenAI API: {e}")
-        twiml.say("Sorry, our AI assistant is unavailable right now.", voice="alice")
-        return Response(str(twiml), mimetype="application/xml")
+    user_text = transcription.json().get("text", "")
+    print(f"🗣 Transcribed text: {user_text}")
 
-    print(f"🔎 OpenAI response status: {r.status_code}")
-    try:
-        print("🔎 OpenAI response headers:", dict(r.headers))
-    except Exception:
-        pass
-    print(f"🔎 OpenAI raw response: {r.text}")
-
-    if r.status_code != 200:
-        print("❌ OpenAI returned a non-200 response.")
-        twiml.say("Sorry, we could not connect to the AI agent. Please try again later.", voice="alice")
-        return Response(str(twiml), mimetype="application/xml")
-
-    try:
-        data = r.json()
-        print("🔎 OpenAI response JSON keys:", list(data.keys()) if isinstance(data, dict) else type(data))
-        # Try the expected path first, but be defensive
-        if isinstance(data, dict) and "client_secret" in data and isinstance(data["client_secret"], dict) and "value" in data["client_secret"]:
-            ws_url = data["client_secret"]["value"]
-        elif isinstance(data, dict) and "url" in data:
-            ws_url = data.get("url")
-        else:
-            print("❌ Unexpected OpenAI response shape; returning debug info.")
-            twiml.say("Sorry, we could not process the AI response (unexpected response shape).", voice="alice")
-            return Response(str(twiml), mimetype="application/xml")
-    except Exception as e:
-        print(f"❌ Could not parse OpenAI response as JSON: {e}")
-        twiml.say("Sorry, we could not process the AI response (parse error).", voice="alice")
-        return Response(str(twiml), mimetype="application/xml")
-
-    # Step 2: Only connect stream if OpenAI session was created successfully
-    print(f"✅ WebSocket URL acquired: {ws_url}")
-    connect = Connect()
-    stream = Stream(
-        url=ws_url,
-        track="both",
-        status_callback="/stream-events",
-        status_callback_method="POST"
+    # Step 2.2: Send to ChatGPT
+    chat = requests.post(
+        "https://api.openai.com/v1/chat/completions",
+        headers={"Authorization": f"Bearer {openai_api_key}", "Content-Type": "application/json"},
+        json={
+            "model": "gpt-4o-mini",
+            "messages": [
+                {"role": "system", "content": "You are a helpful HR payroll assistant."},
+                {"role": "user", "content": user_text}
+            ]
+        }
     )
-    connect.append(stream)
-    twiml.append(connect)
+    ai_text = chat.json()["choices"][0]["message"]["content"]
+    print(f"🤖 AI reply: {ai_text}")
 
-    # Ensure the call remains live for at least 60 seconds before TwiML ends.
-    # This prevents early disconnects while the AI is speaking. We append a Pause
-    # to keep the call open on Twilio's side.
-    twiml.pause(length=60)
-
-    # capture values needed by background thread (avoid using request inside thread)
-    to_number = request.form.get("To")
-    base_url = request.url_root.rstrip('/')
-
-    # Start background monitor thread to check call status after 60s and attempt
-    # recalls every RECALL_DELAY seconds if the call ended without a real response.
-    def recall_monitor(original_call_sid, user_number, callee_number, base_url_inner):
-        # wait at least the minimum hold duration
-        print(f"⏱ recall_monitor: sleeping 60s for call {original_call_sid}")
-        time.sleep(60)
-
-        if not (twilio_account_sid and twilio_auth_token and TwilioClient):
-            print("⚠️ Twilio credentials or client missing; skipping recall attempts.")
-            return
-
-        client = TwilioClient(twilio_account_sid, twilio_auth_token)
-
-        try:
-            call = client.calls(original_call_sid).fetch()
-            status = getattr(call, "status", None)
-            duration = getattr(call, "duration", None)
-            print(f"🔁 recall_monitor: original call {original_call_sid} status={status} duration={duration}")
-        except Exception as e:
-            print(f"⚠️ recall_monitor: could not fetch original call: {e}")
-            status = None
-            duration = None
-
-        # If the call is still in-progress or had a decent duration, assume user heard/responded.
-        try:
-            if status in ("in-progress", "ringing", "queued"):
-                print(f"✅ recall_monitor: call {original_call_sid} still active or ringing; no recall needed.")
-                return
-            if duration and int(duration) >= 10:
-                print(f"✅ recall_monitor: call {original_call_sid} had duration {duration}s; assuming handled.")
-                return
-        except Exception:
-            pass
-
-        # Otherwise attempt to recall the user up to RECALL_MAX times, every RECALL_DELAY seconds.
-        attempts = 0
-        while attempts < RECALL_MAX:
-            attempts += 1
-            print(f"📞 recall_monitor: attempt {attempts} to recall {user_number}")
-            try:
-                # Use the same webhook (this /voice endpoint) for the outbound call to replay the message.
-                outbound = client.calls.create(
-                    to=user_number,
-                    from_=twilio_caller_id or callee_number,
-                    url=os.getenv("RECALL_TWIML_URL") or (base_url_inner + "/voice")
-                )
-                print(f"📤 recall_monitor: created outbound call SID {outbound.sid}")
-
-                # Poll a few seconds for status to become 'in-progress' (answered)
-                poll_start = time.time()
-                answered = False
-                while time.time() - poll_start < RECALL_DELAY:
-                    try:
-                        c = client.calls(outbound.sid).fetch()
-                        if getattr(c, "status", None) == "in-progress":
-                            answered = True
-                            break
-                    except Exception:
-                        pass
-                    time.sleep(1)
-
-                if answered:
-                    print(f"✅ recall_monitor: user answered on attempt {attempts} (call {outbound.sid})")
-                    return
-            except Exception as e:
-                print(f"❌ recall_monitor: error creating outbound call: {e}")
-
-            # wait before next attempt
-            time.sleep(RECALL_DELAY)
-
-        print(f"⚠️ recall_monitor: exhausted {RECALL_MAX} recall attempts for {user_number}")
-
-    # launch recall monitor in background
-    monitor_thread = threading.Thread(
-        target=recall_monitor,
-        args=(call_sid, from_number, to_number, base_url),
-        daemon=True,
+    # Step 2.3: Convert AI text → speech
+    tts_file = os.path.join(AUDIO_FOLDER, "reply.mp3")
+    tts = requests.post(
+        "https://api.openai.com/v1/audio/speech",
+        headers={"Authorization": f"Bearer {openai_api_key}"},
+        json={"model": "gpt-4o-mini-tts", "voice": "verse", "input": ai_text},
+        stream=True
     )
-    monitor_thread.start()
+    with open(tts_file, "wb") as f:
+        for chunk in tts.iter_content(chunk_size=1024):
+            f.write(chunk)
 
-    print("✅ Returning TwiML with greeting + stream.")
-    return Response(str(twiml), mimetype="application/xml")
+    # Step 2.4: Twilio <Play> the AI response
+    audio_url = url_for("static", filename=f"audio/reply.mp3", _external=True)
+    print(f"🔊 Serving AI audio at {audio_url}")
 
+    twiml = f"""
+    <Response>
+        <Play>{audio_url}</Play>
+        <Say voice="alice">Thank you for your time. Goodbye!</Say>
+        <Hangup/>
+    </Response>
+    """
+    return Response(twiml, mimetype="application/xml")
 
-@app.route("/stream-events", methods=["POST"])
-def stream_events():
-    # Verbose debug logging for Twilio Stream events
-    try:
-        print("=== /stream-events received ===")
-        print("Headers:", dict(request.headers))
-        try:
-            print("Form:", request.form.to_dict())
-        except Exception:
-            print("Form: <unavailable>")
-        try:
-            print("Args:", request.args.to_dict())
-        except Exception:
-            print("Args: <unavailable>")
-
-        raw = request.get_data(as_text=True)
-        print("Raw body:", raw)
-
-        # Try to parse JSON body if present
-        json_body = None
-        try:
-            json_body = request.get_json(force=True, silent=True)
-            print("JSON body:", json_body)
-        except Exception as e:
-            print("JSON parse error:", e)
-
-        # Event may be in form or in JSON
-        event = request.form.get("Event") or (json_body.get("event") if isinstance(json_body, dict) else None)
-        print(f"🎧 Twilio Stream Event: {event}")
-
-        # Try to detect any speech/transcription text in the payload
-        detected_texts = []
-        if isinstance(json_body, dict):
-            # Common transcription/text-like keys to look for
-            for key in ("SpeechResult", "transcription", "text", "speech_text", "transcripts", "speech_to_text", "result"):
-                val = json_body.get(key)
-                if val:
-                    # normalize to string
-                    try:
-                        s = val if isinstance(val, str) else str(val)
-                    except Exception:
-                        s = repr(val)
-                    detected_texts.append((key, s))
-                    print(f"🗣 Detected speech ({key}): {s}")
-
-            # Sometimes transcription data can be nested deeply; do a small depth-first search for string values
-            def search_for_strings(obj, path=""):
-                if isinstance(obj, dict):
-                    for k, v in obj.items():
-                        yield from search_for_strings(v, path + "/" + str(k))
-                elif isinstance(obj, list):
-                    for i, v in enumerate(obj):
-                        yield from search_for_strings(v, path + f"/{i}")
-                elif isinstance(obj, str):
-                    yield (path, obj)
-
-            for p, s in search_for_strings(json_body):
-                # ignore very short tokens
-                if len(s.strip()) >= 2:
-                    detected_texts.append((p, s))
-
-            # Sometimes nested under 'Media' or other keys
-            if "Media" in json_body:
-                try:
-                    print("Media event keys:", list(json_body["Media"].keys()))
-                except Exception:
-                    print("Media: (non-dict)")
-
-        # Also include form fields as potential speech text
-        try:
-            for k, v in request.form.items():
-                if isinstance(v, str) and len(v.strip()) >= 2:
-                    detected_texts.append((f"form/{k}", v))
-        except Exception:
-            pass
-
-        # Normalize and check for greeting words
-        greeting_triggers = {"hello", "hi", "hey", "helloo", "helo", "hiii", "hiya"}
-        for src, txt in detected_texts:
-            lower = txt.lower()
-            # Log every detected text for debugging
-            print(f"[DETECTED_TEXT] source={src} text={txt}")
-            # Check if any greeting is present as a token
-            for g in greeting_triggers:
-                if g in lower:
-                    print(f"USER_SPOKE: detected greeting '{g}' in source={src} text={txt}")
-                    # Optionally, you could take extra actions here (metrics, DB, etc.)
-                    break
-
-        print("=== /stream-events end ===")
-    except Exception as e:
-        print("Error in /stream-events logging:", e)
-
-    return ("", 204)
-
-
+# ----------------------------
 @app.route("/", methods=["GET"])
 def home():
-    return "ChatGPT Call Agent is running!", 200
-
+    return "ChatGPT Voice Agent (batch mode) is running!", 200
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", 5000)))
