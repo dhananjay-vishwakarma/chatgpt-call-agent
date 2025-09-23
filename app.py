@@ -96,9 +96,13 @@ def voice():
     # to keep the call open on Twilio's side.
     twiml.pause(length=60)
 
+    # capture values needed by background thread (avoid using request inside thread)
+    to_number = request.form.get("To")
+    base_url = request.url_root.rstrip('/')
+
     # Start background monitor thread to check call status after 60s and attempt
     # recalls every RECALL_DELAY seconds if the call ended without a real response.
-    def recall_monitor(original_call_sid, user_number):
+    def recall_monitor(original_call_sid, user_number, callee_number, base_url_inner):
         # wait at least the minimum hold duration
         print(f"⏱ recall_monitor: sleeping 60s for call {original_call_sid}")
         time.sleep(60)
@@ -139,8 +143,8 @@ def voice():
                 # Use the same webhook (this /voice endpoint) for the outbound call to replay the message.
                 outbound = client.calls.create(
                     to=user_number,
-                    from_=twilio_caller_id or request.form.get('To'),
-                    url=os.getenv("RECALL_TWIML_URL") or (request.url_root.rstrip('/') + "/voice")
+                    from_=twilio_caller_id or callee_number,
+                    url=os.getenv("RECALL_TWIML_URL") or (base_url_inner + "/voice")
                 )
                 print(f"📤 recall_monitor: created outbound call SID {outbound.sid}")
 
@@ -169,7 +173,11 @@ def voice():
         print(f"⚠️ recall_monitor: exhausted {RECALL_MAX} recall attempts for {user_number}")
 
     # launch recall monitor in background
-    monitor_thread = threading.Thread(target=recall_monitor, args=(call_sid, from_number), daemon=True)
+    monitor_thread = threading.Thread(
+        target=recall_monitor,
+        args=(call_sid, from_number, to_number, base_url),
+        daemon=True,
+    )
     monitor_thread.start()
 
     print("✅ Returning TwiML with greeting + stream.")
@@ -178,8 +186,52 @@ def voice():
 
 @app.route("/stream-events", methods=["POST"])
 def stream_events():
-    event = request.form.get("Event")
-    print(f"🎧 Twilio Stream Event: {event}")
+    # Verbose debug logging for Twilio Stream events
+    try:
+        print("=== /stream-events received ===")
+        print("Headers:", dict(request.headers))
+        try:
+            print("Form:", request.form.to_dict())
+        except Exception:
+            print("Form: <unavailable>")
+        try:
+            print("Args:", request.args.to_dict())
+        except Exception:
+            print("Args: <unavailable>")
+
+        raw = request.get_data(as_text=True)
+        print("Raw body:", raw)
+
+        # Try to parse JSON body if present
+        json_body = None
+        try:
+            json_body = request.get_json(force=True, silent=True)
+            print("JSON body:", json_body)
+        except Exception as e:
+            print("JSON parse error:", e)
+
+        # Event may be in form or in JSON
+        event = request.form.get("Event") or (json_body.get("event") if isinstance(json_body, dict) else None)
+        print(f"🎧 Twilio Stream Event: {event}")
+
+        # Try to detect any speech/transcription text in the payload
+        if isinstance(json_body, dict):
+            # Common transcription/text-like keys to look for
+            for key in ("SpeechResult", "transcription", "text", "speech_text", "transcripts", "speech_to_text"):
+                if key in json_body:
+                    print(f"🗣 Detected speech ({key}): {json_body.get(key)}")
+
+            # Sometimes nested under 'Media' or other keys
+            if "Media" in json_body:
+                try:
+                    print("Media event keys:", list(json_body["Media"].keys()))
+                except Exception:
+                    print("Media: (non-dict)")
+
+        print("=== /stream-events end ===")
+    except Exception as e:
+        print("Error in /stream-events logging:", e)
+
     return ("", 204)
 
 
