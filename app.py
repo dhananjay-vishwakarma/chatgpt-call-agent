@@ -12,7 +12,6 @@ def voice():
     print("✅ Twilio POST /voice received")
     print(f"🔔 Caller: {request.form.get('From')} -> Callee: {request.form.get('To')}")
 
-    # Step 1: Create a Realtime Session with OpenAI
     try:
         r = requests.post(
             "https://api.openai.com/v1/realtime/sessions",
@@ -25,24 +24,13 @@ def voice():
                 "voice": "verse",
                 "instructions": (
                     "You are a friendly HRMS payroll software agent. "
-                    "After the call starts, greet warmly, then deliver a concise 60-second pitch "
-                    "about payroll automation, compliance benefits, and cost savings. "
+                    "As soon as the call connects, start speaking immediately. "
+                    "Greet warmly (for example: 'Hello! This is your HRMS payroll assistant'), "
+                    "then deliver a short, engaging 60-second pitch about payroll automation, "
+                    "compliance benefits, and cost savings. "
                     "Keep it conversational and not pushy. "
-                    "Ask one polite follow-up question to engage, then wrap up nicely."
-                ),
-                # 👇 Force ChatGPT to greet immediately (no waiting for caller speech)
-                "conversation": {
-                    "messages": [
-                        {
-                            "role": "system",
-                            "content": (
-                                "Begin speaking immediately once the call starts. "
-                                "Greet warmly (e.g., 'Hello! This is your HRMS payroll assistant'), "
-                                "then go into your pitch naturally."
-                            )
-                        }
-                    ]
-                }
+                    "End by asking one polite follow-up question, then wrap up nicely."
+                )
             }
         )
     except Exception as e:
@@ -67,7 +55,6 @@ def voice():
     ws_url = data["client_secret"]["value"]
     print(f"✅ WebSocket URL acquired: {ws_url}")
 
-    # Step 2: Build TwiML to connect Twilio voice to OpenAI Realtime
     twiml = VoiceResponse()
     connect = Connect()
     connect.stream(url=ws_url)
