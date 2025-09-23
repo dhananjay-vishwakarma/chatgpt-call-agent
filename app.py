@@ -4,7 +4,6 @@ from flask import Flask, Response, request
 from twilio.twiml.voice_response import VoiceResponse, Connect, Stream
 
 app = Flask(__name__)
-
 openai_api_key = os.getenv("OPENAI_API_KEY")
 
 @app.route("/voice", methods=["POST"])
@@ -12,29 +11,27 @@ def voice():
     print("✅ Twilio POST /voice received")
     print(f"🔔 Caller: {request.form.get('From')} -> Callee: {request.form.get('To')}")
 
-    # Always greet before doing anything else — good UX even if AI fails
+    # Start TwiML response with greeting
     twiml = VoiceResponse()
     twiml.say(
         "Hello! Thanks for taking this call. Please hold for a quick message about payroll automation.",
-        voice="alice",
-        language="en-US"
+        voice="alice"
     )
 
-    # Prepare OpenAI session
-    payload = {
-        "model": "gpt-4o-realtime-preview-2024-12",
-        "voice": "verse",
-        "instructions": (
-            "You are a friendly HRMS payroll software agent. "
-            "As soon as the call connects, start speaking immediately. "
-            "Greet warmly, then deliver a concise 60-second pitch about payroll automation, "
-            "compliance benefits, and cost savings. "
-            "Keep it conversational and not pushy. "
-            "End by asking one polite follow-up question, then wrap up nicely."
-        )
-    }
-
+    # Step 1: Create OpenAI session
     try:
+        payload = {
+            "model": "gpt-4o-realtime-preview-2024-12",
+            "voice": "verse",
+            "instructions": (
+                "You are a friendly HRMS payroll software agent. "
+                "As soon as the call connects, start speaking immediately. "
+                "Greet warmly, then deliver a concise 60-second pitch about payroll automation, "
+                "compliance benefits, and cost savings. "
+                "Keep it conversational and not pushy. "
+                "End by asking one polite follow-up question, then wrap up nicely."
+            )
+        }
         print(f"📤 Sending to OpenAI: {payload}")
         r = requests.post(
             "https://api.openai.com/v1/realtime/sessions",
@@ -66,8 +63,8 @@ def voice():
         twiml.say("Sorry, we could not process the AI response.", voice="alice")
         return Response(str(twiml), mimetype="application/xml")
 
+    # Step 2: Only connect stream if OpenAI session was created successfully
     print(f"✅ WebSocket URL acquired: {ws_url}")
-
     connect = Connect()
     stream = Stream(
         url=ws_url,
@@ -78,19 +75,14 @@ def voice():
     connect.append(stream)
     twiml.append(connect)
 
-    print("✅ Returning TwiML to Twilio with greeting + stream.")
+    print("✅ Returning TwiML with greeting + stream.")
     return Response(str(twiml), mimetype="application/xml")
 
 
 @app.route("/stream-events", methods=["POST"])
 def stream_events():
-    """Logs Twilio stream lifecycle events."""
     event = request.form.get("Event")
     print(f"🎧 Twilio Stream Event: {event}")
-    if event == "start":
-        print(f"   ➜ Stream started: {request.form.to_dict()}")
-    elif event == "stop":
-        print(f"   ➜ Stream stopped.")
     return ("", 204)
 
 
