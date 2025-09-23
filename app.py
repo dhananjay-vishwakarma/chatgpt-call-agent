@@ -27,6 +27,13 @@ def voice():
     call_sid = request.form.get("CallSid")
     from_number = request.form.get("From")
 
+    # Quick check: ensure OpenAI API key is set
+    if not openai_api_key:
+        print("❌ OPENAI_API_KEY not set in environment. Cannot create realtime session.")
+        twiml = VoiceResponse()
+        twiml.say("Sorry, the AI assistant is not configured. Please contact support.", voice="alice")
+        return Response(str(twiml), mimetype="application/xml")
+
     # Start TwiML response with greeting
     twiml = VoiceResponse()
     twiml.say(
@@ -64,6 +71,10 @@ def voice():
         return Response(str(twiml), mimetype="application/xml")
 
     print(f"🔎 OpenAI response status: {r.status_code}")
+    try:
+        print("🔎 OpenAI response headers:", dict(r.headers))
+    except Exception:
+        pass
     print(f"🔎 OpenAI raw response: {r.text}")
 
     if r.status_code != 200:
@@ -73,10 +84,19 @@ def voice():
 
     try:
         data = r.json()
-        ws_url = data["client_secret"]["value"]
+        print("🔎 OpenAI response JSON keys:", list(data.keys()) if isinstance(data, dict) else type(data))
+        # Try the expected path first, but be defensive
+        if isinstance(data, dict) and "client_secret" in data and isinstance(data["client_secret"], dict) and "value" in data["client_secret"]:
+            ws_url = data["client_secret"]["value"]
+        elif isinstance(data, dict) and "url" in data:
+            ws_url = data.get("url")
+        else:
+            print("❌ Unexpected OpenAI response shape; returning debug info.")
+            twiml.say("Sorry, we could not process the AI response (unexpected response shape).", voice="alice")
+            return Response(str(twiml), mimetype="application/xml")
     except Exception as e:
-        print(f"❌ Could not parse OpenAI response: {e}")
-        twiml.say("Sorry, we could not process the AI response.", voice="alice")
+        print(f"❌ Could not parse OpenAI response as JSON: {e}")
+        twiml.say("Sorry, we could not process the AI response (parse error).", voice="alice")
         return Response(str(twiml), mimetype="application/xml")
 
     # Step 2: Only connect stream if OpenAI session was created successfully
@@ -215,11 +235,35 @@ def stream_events():
         print(f"🎧 Twilio Stream Event: {event}")
 
         # Try to detect any speech/transcription text in the payload
+        detected_texts = []
         if isinstance(json_body, dict):
             # Common transcription/text-like keys to look for
-            for key in ("SpeechResult", "transcription", "text", "speech_text", "transcripts", "speech_to_text"):
-                if key in json_body:
-                    print(f"🗣 Detected speech ({key}): {json_body.get(key)}")
+            for key in ("SpeechResult", "transcription", "text", "speech_text", "transcripts", "speech_to_text", "result"):
+                val = json_body.get(key)
+                if val:
+                    # normalize to string
+                    try:
+                        s = val if isinstance(val, str) else str(val)
+                    except Exception:
+                        s = repr(val)
+                    detected_texts.append((key, s))
+                    print(f"🗣 Detected speech ({key}): {s}")
+
+            # Sometimes transcription data can be nested deeply; do a small depth-first search for string values
+            def search_for_strings(obj, path=""):
+                if isinstance(obj, dict):
+                    for k, v in obj.items():
+                        yield from search_for_strings(v, path + "/" + str(k))
+                elif isinstance(obj, list):
+                    for i, v in enumerate(obj):
+                        yield from search_for_strings(v, path + f"/{i}")
+                elif isinstance(obj, str):
+                    yield (path, obj)
+
+            for p, s in search_for_strings(json_body):
+                # ignore very short tokens
+                if len(s.strip()) >= 2:
+                    detected_texts.append((p, s))
 
             # Sometimes nested under 'Media' or other keys
             if "Media" in json_body:
@@ -227,6 +271,27 @@ def stream_events():
                     print("Media event keys:", list(json_body["Media"].keys()))
                 except Exception:
                     print("Media: (non-dict)")
+
+        # Also include form fields as potential speech text
+        try:
+            for k, v in request.form.items():
+                if isinstance(v, str) and len(v.strip()) >= 2:
+                    detected_texts.append((f"form/{k}", v))
+        except Exception:
+            pass
+
+        # Normalize and check for greeting words
+        greeting_triggers = {"hello", "hi", "hey", "helloo", "helo", "hiii", "hiya"}
+        for src, txt in detected_texts:
+            lower = txt.lower()
+            # Log every detected text for debugging
+            print(f"[DETECTED_TEXT] source={src} text={txt}")
+            # Check if any greeting is present as a token
+            for g in greeting_triggers:
+                if g in lower:
+                    print(f"USER_SPOKE: detected greeting '{g}' in source={src} text={txt}")
+                    # Optionally, you could take extra actions here (metrics, DB, etc.)
+                    break
 
         print("=== /stream-events end ===")
     except Exception as e:
