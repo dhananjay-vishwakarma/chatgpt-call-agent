@@ -1,108 +1,183 @@
 import os
-import requests
-from flask import Flask, Response, request, url_for
+import json
+import asyncio
+import aiohttp
+import websockets
+from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
+from fastapi.responses import Response, PlainTextResponse
+from twilio.twiml.voice_response import VoiceResponse, Connect, Stream
 
-app = Flask(__name__)
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+OPENAI_REALTIME_MODEL = os.getenv("OPENAI_REALTIME_MODEL", "gpt-4o-realtime-preview-2024-12")
+OPENAI_VOICE = os.getenv("OPENAI_VOICE", "verse")
+AI_INSTRUCTIONS = os.getenv(
+    "AI_INSTRUCTIONS",
+    "You are a friendly HRMS payroll assistant. Greet warmly, "
+    "give a short pitch about payroll automation, "
+    "and ask one polite follow-up question."
+)
 
-# API Keys
-openai_api_key = os.getenv("OPENAI_API_KEY")
+app = FastAPI()
 
-# Folder to save temporary audio files
-AUDIO_FOLDER = "static/audio"
-os.makedirs(AUDIO_FOLDER, exist_ok=True)
 
-# ----------------------------
-# Step 1: Handle incoming call
-# ----------------------------
-@app.route("/voice", methods=["POST"])
-def voice():
-    from_number = request.form.get("From")
+# ---------------------------
+# Twilio webhook: /voice
+# ---------------------------
+@app.post("/voice")
+async def voice(request: Request):
+    form = await request.form()
+    from_number = form.get("From")
     print(f"✅ Incoming call from {from_number}")
 
-    # Ask caller to say something
-    twiml = f"""
-    <Response>
-        <Say voice="alice">Hello! Please tell me your question after the beep. Then press star.</Say>
-        <Record 
-            action="/process_recording" 
-            method="POST" 
-            maxLength="20" 
-            finishOnKey="*"
-            playBeep="true"/>
-        <Say>I did not receive any input. Goodbye.</Say>
-    </Response>
-    """
-    return Response(twiml, mimetype="application/xml")
+    twiml = VoiceResponse()
+    twiml.say("Connecting you to our AI assistant. Please hold.", voice="alice")
 
-# -----------------------------------
-# Step 2: Process recording from user
-# -----------------------------------
-@app.route("/process_recording", methods=["POST"])
-def process_recording():
-    recording_url = request.form.get("RecordingUrl")
-    print(f"🎙 Received recording: {recording_url}.wav")
-
-    # Download Twilio recording (WAV file)
-    audio_file = os.path.join(AUDIO_FOLDER, "caller.wav")
-    r = requests.get(recording_url + ".wav")
-    with open(audio_file, "wb") as f:
-        f.write(r.content)
-
-    # Step 2.1: Transcribe with Whisper
-    with open(audio_file, "rb") as f:
-        transcription = requests.post(
-            "https://api.openai.com/v1/audio/transcriptions",
-            headers={"Authorization": f"Bearer {openai_api_key}"},
-            files={"file": f},
-            data={"model": "gpt-4o-transcribe"}
-        )
-    user_text = transcription.json().get("text", "")
-    print(f"🗣 Transcribed text: {user_text}")
-
-    # Step 2.2: Send to ChatGPT
-    chat = requests.post(
-        "https://api.openai.com/v1/chat/completions",
-        headers={"Authorization": f"Bearer {openai_api_key}", "Content-Type": "application/json"},
-        json={
-            "model": "gpt-4o-mini",
-            "messages": [
-                {"role": "system", "content": "You are a helpful HR payroll assistant."},
-                {"role": "user", "content": user_text}
-            ]
-        }
+    connect = Connect()
+    stream = Stream(
+        url="wss://YOUR_DOMAIN/ws",   # <-- important: relay endpoint in this same app
+        track="both",
+        status_callback="/stream-events",
+        status_callback_method="POST"
     )
-    ai_text = chat.json()["choices"][0]["message"]["content"]
-    print(f"🤖 AI reply: {ai_text}")
+    connect.append(stream)
+    twiml.append(connect)
 
-    # Step 2.3: Convert AI text → speech
-    tts_file = os.path.join(AUDIO_FOLDER, "reply.mp3")
-    tts = requests.post(
-        "https://api.openai.com/v1/audio/speech",
-        headers={"Authorization": f"Bearer {openai_api_key}"},
-        json={"model": "gpt-4o-mini-tts", "voice": "verse", "input": ai_text},
-        stream=True
-    )
-    with open(tts_file, "wb") as f:
-        for chunk in tts.iter_content(chunk_size=1024):
-            f.write(chunk)
+    # keep call open long enough
+    twiml.pause(length=60)
+    return Response(content=str(twiml), media_type="application/xml")
 
-    # Step 2.4: Twilio <Play> the AI response
-    audio_url = url_for("static", filename=f"audio/reply.mp3", _external=True)
-    print(f"🔊 Serving AI audio at {audio_url}")
 
-    twiml = f"""
-    <Response>
-        <Play>{audio_url}</Play>
-        <Say voice="alice">Thank you for your time. Goodbye!</Say>
-        <Hangup/>
-    </Response>
-    """
-    return Response(twiml, mimetype="application/xml")
+# ---------------------------
+# Twilio debug logger: /stream-events
+# ---------------------------
+@app.post("/stream-events")
+async def stream_events(request: Request):
+    print("=== Twilio Stream Event ===")
+    try:
+        form = await request.form()
+        print("Form:", dict(form))
+    except Exception:
+        pass
+    body = await request.body()
+    print("Raw body:", body.decode("utf-8"))
+    return PlainTextResponse("ok")
 
-# ----------------------------
-@app.route("/", methods=["GET"])
+
+@app.get("/")
 def home():
-    return "ChatGPT Voice Agent (batch mode) is running!", 200
+    return PlainTextResponse("ChatGPT Voice Relay is running!")
 
-if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.getenv("PORT", 5000)))
+
+# ---------------------------
+# WebSocket relay: /ws
+# ---------------------------
+@app.websocket("/ws")
+async def ws_twilio(websocket: WebSocket):
+    await websocket.accept()
+    print("✅ Twilio connected to /ws")
+
+    # 1. Create OpenAI Realtime session
+    async with aiohttp.ClientSession() as session:
+        payload = {
+            "model": OPENAI_REALTIME_MODEL,
+            "voice": OPENAI_VOICE,
+            "instructions": AI_INSTRUCTIONS,
+        }
+        async with session.post(
+            "https://api.openai.com/v1/realtime/sessions",
+            headers={"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"},
+            json=payload
+        ) as resp:
+            if resp.status != 200:
+                body = await resp.text()
+                print("❌ Failed to create OpenAI session:", resp.status, body)
+                await websocket.close(code=1011)
+                return
+            data = await resp.json()
+
+    ws_url = None
+    if "client_secret" in data and "value" in data["client_secret"]:
+        ws_url = data["client_secret"]["value"]
+    elif "url" in data:
+        ws_url = data["url"]
+    if not ws_url:
+        print("❌ Unexpected OpenAI response:", data)
+        await websocket.close(code=1011)
+        return
+
+    # 2. Connect to OpenAI Realtime WS
+    try:
+        openai_ws = await websockets.connect(
+            ws_url,
+            extra_headers={"Authorization": f"Bearer {OPENAI_API_KEY}"},
+            subprotocols=["openai-realtime-v1"],
+            max_size=8 * 1024 * 1024,
+        )
+        print("✅ Connected to OpenAI Realtime")
+    except Exception as e:
+        print("❌ Could not connect OpenAI WS:", e)
+        await websocket.close(code=1011)
+        return
+
+    async def twilio_to_openai():
+        try:
+            async for raw in websocket.iter_text():
+                msg = json.loads(raw)
+                etype = msg.get("event")
+                if etype == "start":
+                    print("🔔 Twilio stream started")
+                    await openai_ws.send(json.dumps({
+                        "type": "response.create",
+                        "response": {
+                            "instructions": AI_INSTRUCTIONS,
+                            "modalities": ["audio"],
+                            "conversation": "default",
+                        }
+                    }))
+                elif etype == "media":
+                    audio_b64 = msg.get("media", {}).get("payload")
+                    if audio_b64:
+                        await openai_ws.send(json.dumps({
+                            "type": "input_audio_buffer.append",
+                            "audio": audio_b64,
+                        }))
+                elif etype == "stop":
+                    print("🛑 Twilio stream stopped")
+                    await openai_ws.send(json.dumps({"type": "input_audio_buffer.commit"}))
+                    await openai_ws.send(json.dumps({"type": "response.create"}))
+                    break
+        except WebSocketDisconnect:
+            pass
+        except Exception as e:
+            print("❌ Error twilio_to_openai:", e)
+        try:
+            await openai_ws.close()
+        except:
+            pass
+
+    async def openai_to_twilio():
+        try:
+            async for raw in openai_ws:
+                try:
+                    data = json.loads(raw)
+                except:
+                    continue
+                dtype = data.get("type")
+                if dtype == "output_audio_buffer.append":
+                    audio_chunk_b64 = data.get("audio")
+                    if audio_chunk_b64:
+                        await websocket.send_text(json.dumps({
+                            "event": "media",
+                            "media": {"payload": audio_chunk_b64}
+                        }))
+                elif dtype == "response.completed":
+                    print("✅ OpenAI response completed")
+        except Exception as e:
+            print("❌ Error openai_to_twilio:", e)
+        try:
+            await websocket.close()
+        except:
+            pass
+
+    await asyncio.gather(twilio_to_openai(), openai_to_twilio())
+    print("🔚 Relay session ended")
