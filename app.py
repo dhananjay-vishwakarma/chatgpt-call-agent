@@ -3,10 +3,14 @@ import json
 import asyncio
 import aiohttp
 import websockets
+import time
 from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import Response, PlainTextResponse
 from twilio.twiml.voice_response import VoiceResponse, Connect, Stream
 
+# ---------------------------
+# Config
+# ---------------------------
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 OPENAI_REALTIME_MODEL = os.getenv("OPENAI_REALTIME_MODEL", "gpt-4o-realtime-preview-2024-12")
 OPENAI_VOICE = os.getenv("OPENAI_VOICE", "verse")
@@ -14,7 +18,7 @@ AI_INSTRUCTIONS = os.getenv(
     "AI_INSTRUCTIONS",
     "You are a friendly HRMS payroll assistant. Greet warmly, "
     "give a short pitch about payroll automation, compliance, "
-    "and cost savings. Ask follow-up questions to keep the conversation going."
+    "and cost savings. Ask polite follow-up questions to keep the conversation going."
 )
 
 app = FastAPI()
@@ -34,7 +38,7 @@ async def voice(request: Request):
 
     connect = Connect()
     stream = Stream(
-        url="wss://YOUR_DOMAIN/ws",   # <-- replace with your relay URL
+        url="wss://YOUR_DOMAIN/ws",   # <-- replace with your deployed relay URL
         track="both",
         status_callback="/stream-events",
         status_callback_method="POST"
@@ -42,7 +46,7 @@ async def voice(request: Request):
     connect.append(stream)
     twiml.append(connect)
 
-    # keep the call open (AI keeps the loop alive)
+    # keep call open (AI will keep conversation alive)
     twiml.pause(length=600)  # 10 minutes
     return Response(content=str(twiml), media_type="application/xml")
 
@@ -119,14 +123,24 @@ async def ws_twilio(websocket: WebSocket):
         await websocket.close(code=1011)
         return
 
+    # ---------------------------
+    # Duplex bridges
+    # ---------------------------
+
     async def twilio_to_openai():
+        """
+        Forward caller audio continuously to OpenAI,
+        commit buffer ~every 1s to trigger incremental replies.
+        """
+        last_commit = time.time()
         try:
             async for raw in websocket.iter_text():
                 msg = json.loads(raw)
                 etype = msg.get("event")
+
                 if etype == "start":
                     print("🔔 Twilio stream started")
-                    # send initial greeting from AI
+                    # Kick off AI greeting immediately
                     await openai_ws.send(json.dumps({
                         "type": "response.create",
                         "response": {
@@ -135,6 +149,7 @@ async def ws_twilio(websocket: WebSocket):
                             "conversation": "default",
                         }
                     }))
+
                 elif etype == "media":
                     audio_b64 = msg.get("media", {}).get("payload")
                     if audio_b64:
@@ -142,27 +157,42 @@ async def ws_twilio(websocket: WebSocket):
                             "type": "input_audio_buffer.append",
                             "audio": audio_b64,
                         }))
+
+                        # Commit buffer roughly every second
+                        now = time.time()
+                        if now - last_commit > 1.0:
+                            await openai_ws.send(json.dumps({"type": "input_audio_buffer.commit"}))
+                            await openai_ws.send(json.dumps({
+                                "type": "response.create",
+                                "response": {"conversation": "default", "modalities": ["audio"]}
+                            }))
+                            last_commit = now
+
                 elif etype == "stop":
                     print("🛑 Twilio stream stopped")
-                    await openai_ws.send(json.dumps({"type": "input_audio_buffer.commit"}))
-                    await openai_ws.send(json.dumps({"type": "response.create"}))
                     break
+
         except WebSocketDisconnect:
             pass
         except Exception as e:
             print("❌ Error twilio_to_openai:", e)
+
         try:
             await openai_ws.close()
         except:
             pass
 
     async def openai_to_twilio():
+        """
+        Forward AI audio back to Twilio in real time.
+        """
         try:
             async for raw in openai_ws:
                 try:
                     data = json.loads(raw)
                 except:
                     continue
+
                 dtype = data.get("type")
                 if dtype == "output_audio_buffer.append":
                     audio_chunk_b64 = data.get("audio")
@@ -172,9 +202,10 @@ async def ws_twilio(websocket: WebSocket):
                             "media": {"payload": audio_chunk_b64}
                         }))
                 elif dtype == "response.completed":
-                    print("✅ OpenAI finished a reply")
+                    print("✅ AI finished a reply (conversation continues)")
         except Exception as e:
             print("❌ Error openai_to_twilio:", e)
+
         try:
             await websocket.close()
         except:
