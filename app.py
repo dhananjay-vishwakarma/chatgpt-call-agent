@@ -29,7 +29,20 @@ def voice():
                     "about payroll automation, compliance benefits, and cost savings. "
                     "Keep it conversational and not pushy. "
                     "Ask one polite follow-up question to engage, then wrap up nicely."
-                )
+                ),
+                # 👇 Force ChatGPT to greet immediately (no waiting for caller speech)
+                "conversation": {
+                    "messages": [
+                        {
+                            "role": "system",
+                            "content": (
+                                "Begin speaking immediately once the call starts. "
+                                "Greet warmly (e.g., 'Hello! This is your HRMS payroll assistant'), "
+                                "then go into your pitch naturally."
+                            )
+                        }
+                    ]
+                }
             }
         )
     except Exception as e:
