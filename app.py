@@ -4,6 +4,8 @@ import asyncio
 import aiohttp
 import websockets
 import time
+import base64
+import audioop  # <-- for μ-law → PCM16 conversion
 from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import Response, PlainTextResponse
 from twilio.twiml.voice_response import VoiceResponse, Connect, Stream
@@ -20,6 +22,8 @@ AI_INSTRUCTIONS = os.getenv(
     "give a short pitch about payroll automation, compliance, "
     "and cost savings. Ask polite follow-up questions to keep the conversation going."
 )
+
+COMMIT_INTERVAL = float(os.getenv("COMMIT_INTERVAL", "1.0"))  # seconds between commits
 
 app = FastAPI()
 
@@ -130,7 +134,7 @@ async def ws_twilio(websocket: WebSocket):
     async def twilio_to_openai():
         """
         Forward caller audio continuously to OpenAI,
-        commit buffer ~every 1s to trigger incremental replies.
+        convert μ-law → PCM16, commit ~every COMMIT_INTERVAL.
         """
         last_commit = time.time()
         try:
@@ -153,14 +157,23 @@ async def ws_twilio(websocket: WebSocket):
                 elif etype == "media":
                     audio_b64 = msg.get("media", {}).get("payload")
                     if audio_b64:
-                        await openai_ws.send(json.dumps({
-                            "type": "input_audio_buffer.append",
-                            "audio": audio_b64,
-                        }))
+                        try:
+                            # Decode μ-law audio from Twilio
+                            mulaw_audio = base64.b64decode(audio_b64)
+                            pcm16_audio = audioop.ulaw2lin(mulaw_audio, 2)  # → 16-bit PCM
+                            pcm16_b64 = base64.b64encode(pcm16_audio).decode("utf-8")
 
-                        # Commit buffer roughly every second
+                            # Send PCM16 audio to OpenAI
+                            await openai_ws.send(json.dumps({
+                                "type": "input_audio_buffer.append",
+                                "audio": pcm16_b64,
+                            }))
+                        except Exception as e:
+                            print("⚠️ Audio decode error:", e)
+
+                        # Commit buffer periodically
                         now = time.time()
-                        if now - last_commit > 1.0:
+                        if now - last_commit > COMMIT_INTERVAL:
                             await openai_ws.send(json.dumps({"type": "input_audio_buffer.commit"}))
                             await openai_ws.send(json.dumps({
                                 "type": "response.create",
