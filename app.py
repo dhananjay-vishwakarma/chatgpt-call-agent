@@ -5,7 +5,7 @@ import aiohttp
 import websockets
 import time
 import base64
-import audioop  # <-- for μ-law → PCM16 conversion
+import numpy as np
 from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import Response, PlainTextResponse
 from twilio.twiml.voice_response import VoiceResponse, Connect, Stream
@@ -26,6 +26,20 @@ AI_INSTRUCTIONS = os.getenv(
 COMMIT_INTERVAL = float(os.getenv("COMMIT_INTERVAL", "1.0"))  # seconds between commits
 
 app = FastAPI()
+
+
+# ---------------------------
+# μ-law → PCM16 converter (no audioop)
+# ---------------------------
+MU_LAW_EXPAND_TABLE = np.array([
+    int(((i ^ 0xFF) - 128) * 256) for i in range(256)
+], dtype=np.int16)
+
+def mulaw_to_pcm16(audio_b64: str) -> str:
+    """Convert base64 μ-law audio from Twilio into base64 PCM16 for OpenAI."""
+    mulaw_bytes = base64.b64decode(audio_b64)
+    pcm16 = MU_LAW_EXPAND_TABLE[np.frombuffer(mulaw_bytes, dtype=np.uint8)]
+    return base64.b64encode(pcm16.tobytes()).decode("utf-8")
 
 
 # ---------------------------
@@ -132,10 +146,6 @@ async def ws_twilio(websocket: WebSocket):
     # ---------------------------
 
     async def twilio_to_openai():
-        """
-        Forward caller audio continuously to OpenAI,
-        convert μ-law → PCM16, commit ~every COMMIT_INTERVAL.
-        """
         last_commit = time.time()
         try:
             async for raw in websocket.iter_text():
@@ -158,12 +168,7 @@ async def ws_twilio(websocket: WebSocket):
                     audio_b64 = msg.get("media", {}).get("payload")
                     if audio_b64:
                         try:
-                            # Decode μ-law audio from Twilio
-                            mulaw_audio = base64.b64decode(audio_b64)
-                            pcm16_audio = audioop.ulaw2lin(mulaw_audio, 2)  # → 16-bit PCM
-                            pcm16_b64 = base64.b64encode(pcm16_audio).decode("utf-8")
-
-                            # Send PCM16 audio to OpenAI
+                            pcm16_b64 = mulaw_to_pcm16(audio_b64)
                             await openai_ws.send(json.dumps({
                                 "type": "input_audio_buffer.append",
                                 "audio": pcm16_b64,
@@ -171,7 +176,6 @@ async def ws_twilio(websocket: WebSocket):
                         except Exception as e:
                             print("⚠️ Audio decode error:", e)
 
-                        # Commit buffer periodically
                         now = time.time()
                         if now - last_commit > COMMIT_INTERVAL:
                             await openai_ws.send(json.dumps({"type": "input_audio_buffer.commit"}))
@@ -196,9 +200,6 @@ async def ws_twilio(websocket: WebSocket):
             pass
 
     async def openai_to_twilio():
-        """
-        Forward AI audio back to Twilio in real time.
-        """
         try:
             async for raw in openai_ws:
                 try:

@@ -5,3 +5,4 @@ aiohttp==3.10.5
 twilio==9.3.0
 python-dotenv==1.0.1
 python-multipart==0.0.9
+numpy==1.26.4
