@@ -24,6 +24,8 @@ AI_INSTRUCTIONS = os.getenv(
 )
 
 COMMIT_INTERVAL = float(os.getenv("COMMIT_INTERVAL", "1.0"))  # seconds between commits
+OPENAI_AUDIO_SAMPLE_RATE = int(os.getenv("OPENAI_AUDIO_SAMPLE_RATE", "24000"))
+TELEPHONY_SAMPLE_RATE = 8000
 
 app = FastAPI()
 
@@ -40,6 +42,62 @@ def mulaw_to_pcm16(audio_b64: str) -> str:
     mulaw_bytes = base64.b64decode(audio_b64)
     pcm16 = MU_LAW_EXPAND_TABLE[np.frombuffer(mulaw_bytes, dtype=np.uint8)]
     return base64.b64encode(pcm16.tobytes()).decode("utf-8")
+
+
+# ---------------------------
+# PCM16 -> μ-law (G.711-like) encoder + resampler
+# ---------------------------
+def resample_pcm16(pcm: np.ndarray, src_rate: int, tgt_rate: int) -> np.ndarray:
+    """Simple linear resampler from src_rate to tgt_rate for 1-D int16 array."""
+    if src_rate == tgt_rate:
+        return pcm
+    if len(pcm) == 0:
+        return pcm
+    # duration in seconds
+    duration = len(pcm) / float(src_rate)
+    tgt_len = int(np.round(duration * tgt_rate))
+    if tgt_len <= 0:
+        return np.array([], dtype=np.int16)
+    # linear interpolation on sample indices
+    src_idx = np.linspace(0, len(pcm) - 1, num=len(pcm))
+    tgt_idx = np.linspace(0, len(pcm) - 1, num=tgt_len)
+    resampled = np.interp(tgt_idx, src_idx, pcm).astype(np.int16)
+    return resampled
+
+
+def pcm16_to_mulaw_bytes(pcm16_bytes: bytes) -> bytes:
+    """Convert raw PCM16 little-endian bytes to 8-bit μ-law bytes (base G.711-like companding).
+
+    This uses a float-based μ-law companding which produces acceptable telephony audio
+    without adding heavy native dependencies.
+    """
+    if not pcm16_bytes:
+        return b""
+    pcm = np.frombuffer(pcm16_bytes, dtype=np.int16).astype(np.float32)
+    # normalize to [-1, 1]
+    pcm_norm = pcm / 32768.0
+    mu = 255.0
+    # μ-law companding
+    companded = np.sign(pcm_norm) * np.log1p(mu * np.abs(pcm_norm)) / np.log1p(mu)
+    # quantize to 8-bit unsigned (0..255)
+    ulaw = ((companded + 1.0) / 2.0 * mu + 0.5).clip(0, 255).astype(np.uint8)
+    return ulaw.tobytes()
+
+
+def pcm16_base64_to_mulaw_base64(pcm16_b64: str, src_rate: int, tgt_rate: int = TELEPHONY_SAMPLE_RATE) -> str:
+    """Convert base64 PCM16 (little-endian) at src_rate to base64 μ-law @ tgt_rate."""
+    try:
+        pcm_bytes = base64.b64decode(pcm16_b64)
+        if not pcm_bytes:
+            return ""
+        pcm = np.frombuffer(pcm_bytes, dtype=np.int16)
+        if src_rate != tgt_rate:
+            pcm = resample_pcm16(pcm, src_rate, tgt_rate)
+        mulaw_bytes = pcm16_to_mulaw_bytes(pcm.tobytes())
+        return base64.b64encode(mulaw_bytes).decode("utf-8")
+    except Exception as e:
+        print("⚠️ pcm16->mulaw conversion failed:", e)
+        return ""
 
 
 # ---------------------------
@@ -211,10 +269,20 @@ async def ws_twilio(websocket: WebSocket):
                 if dtype == "output_audio_buffer.append":
                     audio_chunk_b64 = data.get("audio")
                     if audio_chunk_b64:
-                        await websocket.send_text(json.dumps({
-                            "event": "media",
-                            "media": {"payload": audio_chunk_b64}
-                        }))
+                        # OpenAI sends PCM16 at OPENAI_AUDIO_SAMPLE_RATE (commonly 24000).
+                        # Twilio expects μ-law at 8kHz for telephony. Convert before sending.
+                        mulaw_b64 = pcm16_base64_to_mulaw_base64(audio_chunk_b64, src_rate=OPENAI_AUDIO_SAMPLE_RATE, tgt_rate=TELEPHONY_SAMPLE_RATE)
+                        if mulaw_b64:
+                            await websocket.send_text(json.dumps({
+                                "event": "media",
+                                "media": {"payload": mulaw_b64}
+                            }))
+                        else:
+                            # Fallback: send the original audio if conversion fails
+                            await websocket.send_text(json.dumps({
+                                "event": "media",
+                                "media": {"payload": audio_chunk_b64}
+                            }))
                 elif dtype == "response.completed":
                     print("✅ AI finished a reply (conversation continues)")
         except Exception as e:
